@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,25 +12,33 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/apernet/hysteria/app/v2/internal/mimic"
 
 	"github.com/caddyserver/certmagic"
 	"github.com/libdns/cloudflare"
 	"github.com/libdns/duckdns"
 	"github.com/libdns/gandi"
 	"github.com/libdns/godaddy"
-	"github.com/libdns/namedotcom"
-	"github.com/libdns/vultr"
-	"github.com/mholt/acmez/acme"
+	"github.com/libdns/namecheap"
+	"github.com/libdns/njalla"
+	"github.com/libdns/porkbun"
+	"github.com/libdns/vultr/v2"
+	"github.com/mholt/acmez/v3/acme"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/apernet/hysteria/app/v2/internal/firewall"
 	"github.com/apernet/hysteria/app/v2/internal/utils"
@@ -39,13 +48,17 @@ import (
 	"github.com/apernet/hysteria/extras/v2/masq"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/outbounds"
+	"github.com/apernet/hysteria/extras/v2/realm"
 	"github.com/apernet/hysteria/extras/v2/sniff"
 	"github.com/apernet/hysteria/extras/v2/trafficlogger"
 	eUtils "github.com/apernet/hysteria/extras/v2/utils"
 )
 
 const (
-	defaultListenAddr = ":443"
+	defaultListenAddr                  = ":443"
+	masqueradeProxyBufferSize          = 32 * 1024
+	masqueradeProxyMaxIdleConnections  = 100
+	masqueradeProxyMaxIdleConnsPerHost = 32
 )
 
 var serverCmd = &cobra.Command{
@@ -60,10 +73,13 @@ func init() {
 
 type serverConfig struct {
 	Listen                string                      `mapstructure:"listen"`
+	Realm                 serverConfigRealm           `mapstructure:"realm"`
 	Obfs                  serverConfigObfs            `mapstructure:"obfs"`
 	TLS                   *serverConfigTLS            `mapstructure:"tls"`
 	ACME                  *serverConfigACME           `mapstructure:"acme"`
+	ECH                   *serverConfigECH            `mapstructure:"ech"`
 	QUIC                  serverConfigQUIC            `mapstructure:"quic"`
+	Mimic                 mimicConfig                 `mapstructure:"mimic"`
 	Congestion            serverConfigCongestion      `mapstructure:"congestion"`
 	Bandwidth             serverConfigBandwidth       `mapstructure:"bandwidth"`
 	IgnoreClientBandwidth bool                        `mapstructure:"ignoreClientBandwidth"`
@@ -79,13 +95,30 @@ type serverConfig struct {
 	Masquerade            serverConfigMasquerade      `mapstructure:"masquerade"`
 }
 
+type serverConfigRealm struct {
+	STUNServers       []string               `mapstructure:"stunServers"`
+	STUNTimeout       time.Duration          `mapstructure:"stunTimeout"`
+	PunchTimeout      time.Duration          `mapstructure:"punchTimeout"`
+	HeartbeatInterval time.Duration          `mapstructure:"heartbeatInterval"`
+	Insecure          bool                   `mapstructure:"insecure"`
+	IPMode            string                 `mapstructure:"ipMode"`
+	PortMapping       realmPortMappingConfig `mapstructure:"portMapping"`
+}
+
 type serverConfigObfsSalamander struct {
 	Password string `mapstructure:"password"`
+}
+
+type serverConfigObfsGecko struct {
+	Password      string `mapstructure:"password"`
+	MinPacketSize int    `mapstructure:"minPacketSize"`
+	MaxPacketSize int    `mapstructure:"maxPacketSize"`
 }
 
 type serverConfigObfs struct {
 	Type       string                     `mapstructure:"type"`
 	Salamander serverConfigObfsSalamander `mapstructure:"salamander"`
+	Gecko      serverConfigObfsGecko      `mapstructure:"gecko"`
 }
 
 type serverConfigTLS struct {
@@ -93,6 +126,10 @@ type serverConfigTLS struct {
 	Key      string `mapstructure:"key"`
 	SNIGuard string `mapstructure:"sniGuard"` // "disable", "dns-san", "strict"
 	ClientCA string `mapstructure:"clientCA"`
+}
+
+type serverConfigECH struct {
+	KeyPath string `mapstructure:"keyPath"`
 }
 
 type serverConfigACME struct {
@@ -138,11 +175,13 @@ type serverConfigQUIC struct {
 	MaxIdleTimeout              time.Duration `mapstructure:"maxIdleTimeout"`
 	MaxIncomingStreams          int64         `mapstructure:"maxIncomingStreams"`
 	DisablePathMTUDiscovery     bool          `mapstructure:"disablePathMTUDiscovery"`
+	DisableStatelessReset       bool          `mapstructure:"disableStatelessReset"`
 }
 
 type serverConfigBandwidth struct {
-	Up   string `mapstructure:"up"`
-	Down string `mapstructure:"down"`
+	Up                      string `mapstructure:"up"`
+	Down                    string `mapstructure:"down"`
+	DisableLossCompensation bool   `mapstructure:"disableLossCompensation"`
 }
 
 type serverConfigCongestion struct {
@@ -204,11 +243,13 @@ type serverConfigSniff struct {
 }
 
 type serverConfigACL struct {
-	File              string        `mapstructure:"file"`
-	Inline            []string      `mapstructure:"inline"`
-	GeoIP             string        `mapstructure:"geoip"`
-	GeoSite           string        `mapstructure:"geosite"`
-	GeoUpdateInterval time.Duration `mapstructure:"geoUpdateInterval"`
+	File              string                `mapstructure:"file"`   // Legacy syntax
+	Inline            []string              `mapstructure:"inline"` // Legacy syntax
+	Rules             []serverConfigACLRule `mapstructure:"rules"`
+	RulesFile         string                `mapstructure:"rulesFile"`
+	GeoIP             string                `mapstructure:"geoip"`
+	GeoSite           string                `mapstructure:"geosite"`
+	GeoUpdateInterval time.Duration         `mapstructure:"geoUpdateInterval"`
 }
 
 type serverConfigOutboundDirect struct {
@@ -254,6 +295,31 @@ type serverConfigMasqueradeProxy struct {
 	Insecure    bool   `mapstructure:"insecure"`
 }
 
+type masqueradeProxyBufferPool struct {
+	pool sync.Pool
+}
+
+func newMasqueradeProxyBufferPool() *masqueradeProxyBufferPool {
+	return &masqueradeProxyBufferPool{
+		pool: sync.Pool{
+			New: func() any {
+				return make([]byte, masqueradeProxyBufferSize)
+			},
+		},
+	}
+}
+
+func (p *masqueradeProxyBufferPool) Get() []byte {
+	return p.pool.Get().([]byte)
+}
+
+func (p *masqueradeProxyBufferPool) Put(buf []byte) {
+	if cap(buf) < masqueradeProxyBufferSize {
+		return
+	}
+	p.pool.Put(buf[:masqueradeProxyBufferSize])
+}
+
 type serverConfigMasqueradeString struct {
 	Content    string            `mapstructure:"content"`
 	Headers    map[string]string `mapstructure:"headers"`
@@ -271,6 +337,12 @@ type serverConfigMasquerade struct {
 }
 
 func (c *serverConfig) fillConn(hyConfig *server.Config) error {
+	if realmAddr, ok, err := parseServerRealmAddr(c.Listen); ok || err != nil {
+		if err != nil {
+			return configError{Field: "listen", Err: err}
+		}
+		return c.fillRealmConn(hyConfig, realmAddr)
+	}
 	listenAddr := c.Listen
 	if listenAddr == "" {
 		listenAddr = defaultListenAddr
@@ -292,29 +364,96 @@ func (c *serverConfig) fillConn(hyConfig *server.Config) error {
 			return configError{Field: "listen", Err: err}
 		}
 	}
-	switch strings.ToLower(c.Obfs.Type) {
-	case "", "plain":
-		hyConfig.Conn = packetConn
-		hyConfig.Cleanup = cleanup
-		return nil
-	case "salamander":
-		ob, err := obfs.NewSalamanderObfuscator([]byte(c.Obfs.Salamander.Password))
-		if err != nil {
-			_ = conn.Close()
-			if cleanup != nil {
-				_ = cleanup.Close()
-			}
-			return configError{Field: "obfs.salamander.password", Err: err}
-		}
-		hyConfig.Conn = obfs.WrapPacketConn(packetConn, ob)
-		hyConfig.Cleanup = cleanup
-		return nil
-	default:
+	wrapped, err := c.wrapObfs(packetConn)
+	if err != nil {
 		_ = conn.Close()
 		if cleanup != nil {
 			_ = cleanup.Close()
 		}
-		return configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
+		return err
+	}
+	hyConfig.Conn = wrapped
+	hyConfig.Cleanup = cleanup
+	return nil
+}
+
+func parseServerRealmAddr(listen string) (*realm.Addr, bool, error) {
+	addr, err := realm.ParseAddr(listen)
+	if err == nil {
+		return addr, true, nil
+	}
+	if strings.HasPrefix(listen, realm.SchemeHTTPS+":") || strings.HasPrefix(listen, realm.SchemeHTTP+":") {
+		return nil, true, err
+	}
+	return nil, false, nil
+}
+
+func (c *serverConfig) fillRealmConn(hyConfig *server.Config, addr *realm.Addr) error {
+	logger.Debug("realm server mode detected",
+		zap.String("realm", addr.RealmID),
+		zap.String("realmServer", addr.HostPort),
+		zap.String("scheme", addr.RendezvousScheme))
+	family, network, err := realmIPMode(c.Realm.IPMode)
+	if err != nil {
+		return configError{Field: "realm.ipMode", Err: err}
+	}
+	listenAddr := &net.UDPAddr{}
+	if addr.LocalPort != 0 {
+		listenAddr.Port = addr.LocalPort
+	}
+	conn, err := correctnet.ListenUDP(network, listenAddr)
+	if err != nil {
+		return configError{Field: "listen", Err: err}
+	}
+	logger.Debug("realm server UDP socket opened",
+		zap.String("realm", addr.RealmID),
+		zap.String("local", conn.LocalAddr().String()))
+
+	punchConn, err := realm.NewPunchPacketConn(conn, 0)
+	if err != nil {
+		_ = conn.Close()
+		return configError{Field: "realm", Err: err}
+	}
+	packetConn, err := c.wrapObfs(punchConn)
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime, err := c.startRealmServerRuntime(ctx, cancel, addr, punchConn, family)
+	if err != nil {
+		cancel()
+		_ = packetConn.Close()
+		return err
+	}
+	hyConfig.Conn = packetConn
+	hyConfig.Cleanup = runtime
+	return nil
+}
+
+func (c *serverConfig) wrapObfs(conn net.PacketConn) (net.PacketConn, error) {
+	switch strings.ToLower(c.Obfs.Type) {
+	case "", "plain":
+		return conn, nil
+	case "salamander":
+		wrapped, err := obfs.WrapPacketConnSalamander(conn, []byte(c.Obfs.Salamander.Password))
+		if err != nil {
+			return nil, configError{Field: "obfs.salamander.password", Err: err}
+		}
+		return wrapped, nil
+	case "gecko":
+		wrapped, err := obfs.WrapPacketConnGecko(conn, obfs.GeckoOptions{
+			Password:      []byte(c.Obfs.Gecko.Password),
+			MinPacketSize: c.Obfs.Gecko.MinPacketSize,
+			MaxPacketSize: c.Obfs.Gecko.MaxPacketSize,
+		})
+		if err != nil {
+			return nil, configError{Field: "obfs.gecko", Err: err}
+		}
+		return wrapped, nil
+	default:
+		return nil, configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
 	}
 }
 
@@ -335,6 +474,481 @@ func resolveServerListenAddr(listenAddr string) (*net.UDPAddr, eUtils.PortUnion,
 	firstListenAddr := net.JoinHostPort(host, strconv.Itoa(int(portUnion[0].Start)))
 	uAddr, err := net.ResolveUDPAddr("udp", firstListenAddr)
 	return uAddr, portUnion, err
+}
+
+func (c *serverConfig) startRealmServerRuntime(ctx context.Context, cancel context.CancelFunc, addr *realm.Addr, punchConn *realm.PunchPacketConn, family realm.AddrFamily) (*realmServerRuntime, error) {
+	stunServers := c.realmSTUNServers(addr)
+	rClient, err := realm.NewClientFromAddr(addr, c.realmHTTPClient())
+	if err != nil {
+		return nil, configError{Field: "realm", Err: err}
+	}
+	puncher, err := realm.NewServerPuncher(ctx, punchConn)
+	if err != nil {
+		return nil, configError{Field: "realm", Err: err}
+	}
+	rt := &realmServerRuntime{
+		cancel:      cancel,
+		client:      rClient,
+		realmID:     addr.RealmID,
+		punchConn:   punchConn,
+		stunServers: stunServers,
+		puncher:     puncher,
+		config:      c.Realm,
+		family:      family,
+	}
+	// Gateway port mapping (UPnP/NAT-PMP) runs before STUN.
+	// With the pinhole in place, in a double-NAT setup,
+	// the address STUN observes corresponds to a path whose inner leg
+	// goes through the static mapping rather than a filtered dynamic one.
+	if c.Realm.PortMapping.Enabled {
+		localPort := 0
+		if udpAddr, ok := punchConn.LocalAddr().(*net.UDPAddr); ok {
+			localPort = udpAddr.Port
+		}
+		rt.mapper = newRealmPortMapper(ctx, addr.RealmID, localPort, c.Realm.PortMapping)
+	}
+	cleanupMapper := func() {
+		if rt.mapper != nil {
+			_ = rt.mapper.Close()
+		}
+	}
+	if _, _, err := rt.refreshAddrsDirect(ctx); err != nil {
+		cleanupMapper()
+		return nil, configError{Field: "realm.stun", Err: err}
+	}
+	initialSession, err := rt.register(ctx)
+	if err != nil {
+		cleanupMapper()
+		return nil, configError{Field: "realm.register", Err: err}
+	}
+	rt.setSession(initialSession)
+	if rt.mapper != nil {
+		go realmPortMapLoop(ctx, addr.RealmID, rt.mapper)
+	}
+	go rt.run(ctx, initialSession)
+	return rt, nil
+}
+
+func (c *serverConfig) realmSTUNServers(addr *realm.Addr) []string {
+	if stunServers := addr.Params["stun"]; len(stunServers) > 0 {
+		return append([]string(nil), stunServers...)
+	}
+	if len(c.Realm.STUNServers) > 0 {
+		return append([]string(nil), c.Realm.STUNServers...)
+	}
+	return append([]string(nil), defaultRealmSTUNServers...)
+}
+
+func (c *serverConfig) realmHTTPClient() *http.Client {
+	if !c.Realm.Insecure {
+		return nil
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	return &http.Client{Transport: tr}
+}
+
+const realmConnectSTUNCacheTTL = 10 * time.Second
+
+type realmServerRuntime struct {
+	cancel      context.CancelFunc
+	client      *realm.Client
+	realmID     string
+	punchConn   *realm.PunchPacketConn
+	stunServers []string
+	puncher     *realm.ServerPuncher
+	config      serverConfigRealm
+	family      realm.AddrFamily
+	mapper      *realm.PortMapper // nil if port mapping is disabled or failed
+
+	mu      sync.Mutex
+	session realmSession
+	addrs   []netip.AddrPort
+	addrsAt time.Time
+
+	connectSF singleflight.Group
+}
+
+type realmSession struct {
+	id  string
+	ttl int
+}
+
+var (
+	errRealmSessionInvalid = errors.New("realm session invalid")
+	errRealmSessionLost    = errors.New("realm session lost")
+)
+
+func (r *realmServerRuntime) run(ctx context.Context, sess realmSession) {
+	for ctx.Err() == nil {
+		if err := r.runSession(ctx, sess); err != nil && ctx.Err() == nil {
+			logger.Warn("realm session lost", zap.String("realm", r.realmID), zap.Error(err))
+		}
+		sess = r.registerWithBackoff(ctx)
+		if sess.id == "" {
+			return
+		}
+	}
+}
+
+func (r *realmServerRuntime) registerWithBackoff(ctx context.Context) realmSession {
+	backoff := time.Second
+	for ctx.Err() == nil {
+		if _, _, err := r.refreshAddrs(ctx); err != nil {
+			logger.Warn("realm STUN refresh before re-register failed", zap.String("realm", r.realmID), zap.Error(err))
+		}
+		sess, err := r.register(ctx)
+		if err == nil {
+			r.setSession(sess)
+			return sess
+		}
+		if isRealmRegisterFatal(err) {
+			logger.Error("realm re-register rejected; giving up", zap.String("realm", r.realmID), zap.Error(err))
+			return realmSession{}
+		}
+		logger.Warn("realm re-register failed", zap.String("realm", r.realmID), zap.Error(err))
+		logger.Debug("realm re-register scheduled", zap.String("realm", r.realmID), zap.String("backoff", formatLogDuration(backoff)))
+		if !sleepContext(ctx, backoff) {
+			return realmSession{}
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+	return realmSession{}
+}
+
+func (r *realmServerRuntime) register(ctx context.Context) (realmSession, error) {
+	localAddrs := r.currentAddrs()
+	logger.Debug("realm registration started",
+		zap.String("realm", r.realmID),
+		zap.Strings("addresses", addrPortStrings(localAddrs)))
+	start := time.Now()
+	registerResp, err := r.client.Register(ctx, r.realmID, addrPortStrings(localAddrs))
+	if err != nil {
+		return realmSession{}, err
+	}
+	sess := realmSession{id: registerResp.SessionID, ttl: registerResp.TTL}
+	logger.Debug("realm registration completed",
+		zap.String("realm", r.realmID),
+		zap.Int("ttl", sess.ttl),
+		zap.String("duration", formatLogDuration(time.Since(start))))
+	logger.Info("realm registered",
+		zap.String("realm", r.realmID),
+		zap.Strings("addresses", addrPortStrings(localAddrs)),
+		zap.Int("ttl", sess.ttl))
+	return sess, nil
+}
+
+func (r *realmServerRuntime) runSession(ctx context.Context, sess realmSession) error {
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() { errCh <- r.heartbeatLoop(sessionCtx, sess) }()
+	go func() { errCh <- r.eventsLoop(sessionCtx, sess) }()
+	err := <-errCh
+	cancel()
+	return err
+}
+
+func (r *realmServerRuntime) heartbeatLoop(ctx context.Context, sess realmSession) error {
+	interval := r.config.HeartbeatInterval
+	if interval == 0 {
+		interval = sessionTTLDuration(sess.ttl) / 2
+		if interval <= 0 {
+			interval = 15 * time.Second
+		}
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	lastOK := time.Now()
+	lastPublished := r.currentAddrs()
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Debug("realm heartbeat loop stopped", zap.String("realm", r.realmID))
+			return ctx.Err()
+		case <-t.C:
+			logger.Debug("realm heartbeat started", zap.String("realm", r.realmID))
+			start := time.Now()
+			req := realm.HeartbeatRequest{}
+			if current := r.currentAddrs(); !slices.Equal(current, lastPublished) {
+				req.Addresses = addrPortStrings(current)
+				lastPublished = current
+				logger.Debug("realm addresses changed", zap.String("realm", r.realmID), zap.Strings("addresses", req.Addresses))
+			}
+			resp, err := r.client.Heartbeat(ctx, r.realmID, sess.id, req)
+			if err != nil {
+				if isRealmSessionInvalid(err) {
+					return errRealmSessionInvalid
+				}
+				logger.Warn("realm heartbeat failed", zap.String("realm", r.realmID), zap.Error(err))
+				if time.Since(lastOK) > sessionTTLDuration(sess.ttl) {
+					return errRealmSessionLost
+				}
+				continue
+			}
+			lastOK = time.Now()
+			logger.Debug("realm heartbeat completed",
+				zap.String("realm", r.realmID),
+				zap.Int("ttl", resp.TTL),
+				zap.Bool("addressesUpdated", len(req.Addresses) > 0),
+				zap.String("duration", formatLogDuration(time.Since(start))))
+			if r.config.HeartbeatInterval == 0 && resp.TTL > 0 {
+				next := time.Duration(resp.TTL) * time.Second / 2
+				if next > 0 && next != interval {
+					interval = next
+					t.Reset(interval)
+				}
+			}
+		}
+	}
+}
+
+func (r *realmServerRuntime) eventsLoop(ctx context.Context, sess realmSession) error {
+	backoff := time.Second
+	lastOK := time.Now()
+	for {
+		if ctx.Err() != nil {
+			logger.Debug("realm events loop stopped", zap.String("realm", r.realmID))
+			return ctx.Err()
+		}
+		logger.Debug("realm events stream connecting", zap.String("realm", r.realmID))
+		stream, err := r.client.Events(ctx, r.realmID, sess.id)
+		if err != nil {
+			if isRealmSessionInvalid(err) {
+				return errRealmSessionInvalid
+			}
+			logger.Warn("realm events stream failed", zap.String("realm", r.realmID), zap.Error(err))
+			if time.Since(lastOK) > sessionTTLDuration(sess.ttl) {
+				return errRealmSessionLost
+			}
+			logger.Debug("realm events stream reconnect scheduled",
+				zap.String("realm", r.realmID),
+				zap.String("backoff", formatLogDuration(backoff)))
+			if !sleepContext(ctx, backoff) {
+				return ctx.Err()
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		lastOK = time.Now()
+		logger.Debug("realm events stream connected", zap.String("realm", r.realmID))
+		backoff = time.Second
+		for {
+			ev, err := stream.Next()
+			if err != nil {
+				_ = stream.Close()
+				if ctx.Err() == nil {
+					logger.Warn("realm events stream dropped", zap.String("realm", r.realmID), zap.Error(err))
+				}
+				break
+			}
+			lastOK = time.Now()
+			logger.Debug("realm punch event received",
+				zap.String("realm", r.realmID),
+				zap.String("attempt", shortAttempt(ev.Nonce)),
+				zap.Strings("addresses", ev.Addresses))
+			go r.respond(ctx, ev)
+		}
+	}
+}
+
+func (r *realmServerRuntime) connectAddrs(ctx context.Context) ([]netip.AddrPort, error) {
+	if cached := r.cachedAddrs(); cached != nil {
+		return cached, nil
+	}
+	v, err, _ := r.connectSF.Do("stun", func() (any, error) {
+		if cached := r.cachedAddrs(); cached != nil {
+			return cached, nil
+		}
+		addrs, _, err := r.refreshAddrs(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return addrs, nil
+	})
+	if err != nil {
+		if fallback := r.currentAddrs(); len(fallback) > 0 {
+			return fallback, err
+		}
+		return nil, err
+	}
+	return v.([]netip.AddrPort), nil
+}
+
+func (r *realmServerRuntime) cachedAddrs() []netip.AddrPort {
+	r.mu.Lock()
+	if r.addrs == nil || time.Since(r.addrsAt) >= realmConnectSTUNCacheTTL {
+		r.mu.Unlock()
+		return nil
+	}
+	addrs := append([]netip.AddrPort(nil), r.addrs...)
+	r.mu.Unlock()
+	return r.withMappedAddr(addrs)
+}
+
+func (r *realmServerRuntime) withMappedAddr(addrs []netip.AddrPort) []netip.AddrPort {
+	if r.mapper == nil {
+		return addrs
+	}
+	return mergeMappedAddr(addrs, r.mapper.ExternalAddr())
+}
+
+func (r *realmServerRuntime) respond(ctx context.Context, ev *realm.PunchEvent) {
+	attempt := shortAttempt(ev.Nonce)
+	peerAddrs, err := parseAddrPorts(ev.Addresses)
+	if err != nil {
+		logger.Warn("invalid realm punch addresses", zap.String("realm", r.realmID), zap.String("attempt", attempt), zap.Error(err))
+		return
+	}
+
+	freshAddrs, stunErr := r.connectAddrs(ctx)
+	if stunErr != nil {
+		logger.Warn("realm connect STUN failed; using last-known addresses",
+			zap.String("realm", r.realmID),
+			zap.String("attempt", attempt),
+			zap.Error(stunErr))
+	}
+
+	if sess := r.currentSession(); sess.id != "" && len(freshAddrs) > 0 {
+		postCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		err := r.client.ConnectResponse(postCtx, r.realmID, sess.id, ev.Nonce, addrPortStrings(freshAddrs))
+		cancel()
+		if err != nil {
+			logger.Warn("realm connect-response post failed",
+				zap.String("realm", r.realmID),
+				zap.String("attempt", attempt),
+				zap.Error(err))
+		}
+	}
+
+	logger.Debug("realm punch response started",
+		zap.String("realm", r.realmID),
+		zap.String("attempt", attempt),
+		zap.Strings("candidates", ev.Addresses))
+	start := time.Now()
+	result, err := r.puncher.Respond(ctx, ev.Nonce, freshAddrs, peerAddrs, ev.PunchMetadata, realm.PunchConfig{
+		Timeout: r.config.PunchTimeout,
+		Family:  r.family,
+	})
+	if err != nil {
+		logger.Warn("realm punch failed", zap.String("realm", r.realmID), zap.String("attempt", attempt), zap.Error(err))
+		return
+	}
+	logger.Debug("realm punch completed",
+		zap.String("realm", r.realmID),
+		zap.String("attempt", attempt),
+		zap.String("peer", result.PeerAddr.String()),
+		zap.String("packet", punchPacketTypeString(result.Packet.Type)),
+		zap.String("duration", formatLogDuration(time.Since(start))))
+}
+
+func (r *realmServerRuntime) Close() error {
+	r.cancel()
+	sess := r.currentSession()
+	if sess.id == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	logger.Debug("realm deregister started", zap.String("realm", r.realmID))
+	if err := r.client.Deregister(ctx, r.realmID, sess.id); err != nil {
+		return err
+	}
+	logger.Info("realm deregistered", zap.String("realm", r.realmID))
+	return nil
+}
+
+func (r *realmServerRuntime) setSession(sess realmSession) {
+	r.mu.Lock()
+	r.session = sess
+	r.mu.Unlock()
+}
+
+func (r *realmServerRuntime) currentSession() realmSession {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.session
+}
+
+func (r *realmServerRuntime) refreshAddrs(ctx context.Context) ([]netip.AddrPort, bool, error) {
+	return r.refreshAddrsWith(ctx, func(ctx context.Context, config realm.STUNConfig) ([]netip.AddrPort, error) {
+		return realm.DiscoverWithDemux(ctx, r.punchConn, config)
+	})
+}
+
+func (r *realmServerRuntime) refreshAddrsDirect(ctx context.Context) ([]netip.AddrPort, bool, error) {
+	return r.refreshAddrsWith(ctx, func(ctx context.Context, config realm.STUNConfig) ([]netip.AddrPort, error) {
+		return realm.Discover(ctx, r.punchConn.PacketConn, config)
+	})
+}
+
+func (r *realmServerRuntime) refreshAddrsWith(ctx context.Context, discover func(context.Context, realm.STUNConfig) ([]netip.AddrPort, error)) ([]netip.AddrPort, bool, error) {
+	logger.Debug("realm server STUN discovery started",
+		zap.String("realm", r.realmID),
+		zap.Strings("stunServers", r.stunServers))
+	start := time.Now()
+	addrs, err := discover(ctx, realm.STUNConfig{
+		Servers: r.stunServers,
+		Timeout: r.config.STUNTimeout,
+		Family:  r.family,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	r.mu.Lock()
+	changed := !slices.Equal(r.addrs, addrs)
+	if changed {
+		r.addrs = append([]netip.AddrPort(nil), addrs...)
+	}
+	r.addrsAt = time.Now()
+	current := append([]netip.AddrPort(nil), r.addrs...)
+	r.mu.Unlock()
+	logger.Debug("realm server STUN discovery completed",
+		zap.String("realm", r.realmID),
+		zap.Strings("addresses", addrPortStrings(current)),
+		zap.Bool("changed", changed),
+		zap.String("duration", formatLogDuration(time.Since(start))))
+	return r.withMappedAddr(current), changed, nil
+}
+
+func (r *realmServerRuntime) currentAddrs() []netip.AddrPort {
+	r.mu.Lock()
+	addrs := append([]netip.AddrPort(nil), r.addrs...)
+	r.mu.Unlock()
+	return r.withMappedAddr(addrs)
+}
+
+func sessionTTLDuration(ttl int) time.Duration {
+	if ttl <= 0 {
+		return time.Minute
+	}
+	return time.Duration(ttl) * time.Second
+}
+
+func isRealmSessionInvalid(err error) bool {
+	var statusErr *realm.StatusError
+	return errors.As(err, &statusErr) &&
+		(statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusNotFound)
+}
+
+func isRealmRegisterFatal(err error) bool {
+	var statusErr *realm.StatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusBadRequest
+}
+
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
@@ -453,48 +1067,56 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			if c.ACME.DNS.Config == nil {
 				return configError{Field: "acme.dns.config", Err: errors.New("empty DNS provider config")}
 			}
+			var dnsProvider certmagic.DNSProvider
 			switch strings.ToLower(c.ACME.DNS.Name) {
 			case "cloudflare":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &cloudflare.Provider{
-						APIToken: c.ACME.DNS.Config["cloudflare_api_token"],
-					},
+				dnsProvider = &cloudflare.Provider{
+					APIToken: c.ACME.DNS.Config["cloudflare_api_token"],
 				}
 			case "duckdns":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &duckdns.Provider{
-						APIToken:       c.ACME.DNS.Config["duckdns_api_token"],
-						OverrideDomain: c.ACME.DNS.Config["duckdns_override_domain"],
-					},
+				dnsProvider = &duckdns.Provider{
+					APIToken:       c.ACME.DNS.Config["duckdns_api_token"],
+					OverrideDomain: c.ACME.DNS.Config["duckdns_override_domain"],
 				}
 			case "gandi":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &gandi.Provider{
-						BearerToken: c.ACME.DNS.Config["gandi_api_token"],
-					},
+				dnsProvider = &gandi.Provider{
+					BearerToken: c.ACME.DNS.Config["gandi_api_token"],
 				}
 			case "godaddy":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &godaddy.Provider{
-						APIToken: c.ACME.DNS.Config["godaddy_api_token"],
-					},
+				dnsProvider = &godaddy.Provider{
+					APIToken: c.ACME.DNS.Config["godaddy_api_token"],
 				}
-			case "namedotcom":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &namedotcom.Provider{
-						Token:  c.ACME.DNS.Config["namedotcom_token"],
-						User:   c.ACME.DNS.Config["namedotcom_user"],
-						Server: c.ACME.DNS.Config["namedotcom_server"],
-					},
+			case "namecheap":
+				dnsProvider = &namecheap.Provider{
+					APIKey:      c.ACME.DNS.Config["namecheap_api_key"],
+					User:        c.ACME.DNS.Config["namecheap_api_user"],
+					APIEndpoint: c.ACME.DNS.Config["namecheap_api_endpoint"],
+					ClientIP:    c.ACME.DNS.Config["namecheap_client_ip"],
+				}
+			case "njalla":
+				dnsProvider = &njalla.Provider{
+					APIToken: c.ACME.DNS.Config["njalla_api_token"],
+				}
+			case "porkbun":
+				dnsProvider = &porkbun.Provider{
+					APIKey:       c.ACME.DNS.Config["porkbun_api_key"],
+					APISecretKey: c.ACME.DNS.Config["porkbun_api_secret_key"],
 				}
 			case "vultr":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &vultr.Provider{
-						APIToken: c.ACME.DNS.Config["vultr_api_token"],
-					},
+				dnsProvider = &vultr.Provider{
+					APIToken: c.ACME.DNS.Config["vultr_api_token"],
 				}
+			case "namedotcom":
+				// Dropped: upstream never released a libdns v1 compatible version,
+				// which the current certmagic requires.
+				return configError{Field: "acme.dns.name", Err: errors.New("namedotcom is no longer supported")}
 			default:
 				return configError{Field: "acme.dns.name", Err: errors.New("unsupported DNS provider")}
+			}
+			cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+				DNSManager: certmagic.DNSManager{
+					DNSProvider: dnsProvider,
+				},
 			}
 		case "":
 			// Legacy compatibility mode
@@ -523,6 +1145,18 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			return configError{Field: "acme.domains", Err: err}
 		}
 		hyConfig.TLSConfig.GetCertificate = cmCfg.GetCertificate
+	}
+	if c.ECH != nil {
+		if c.ECH.KeyPath == "" {
+			return configError{Field: "ech.keyPath", Err: errors.New("empty ECH key path")}
+		}
+		keys, configList, err := utils.LoadECHKeys(c.ECH.KeyPath)
+		if err != nil {
+			return configError{Field: "ech.keyPath", Err: err}
+		}
+		hyConfig.TLSConfig.ECHKeys = keys
+		logger.Info("ECH enabled, set the following config list on clients (tls.ech)",
+			zap.String("configList", base64.StdEncoding.EncodeToString(configList)))
 	}
 	return nil
 }
@@ -578,6 +1212,9 @@ func (c *serverConfig) fillQUICConfig(hyConfig *server.Config) error {
 		MaxIdleTimeout:                 c.QUIC.MaxIdleTimeout,
 		MaxIncomingStreams:             c.QUIC.MaxIncomingStreams,
 		DisablePathMTUDiscovery:        c.QUIC.DisablePathMTUDiscovery,
+		DisableStatelessReset:          c.QUIC.DisableStatelessReset,
+		// See the client side: Mimic and GSO are mutually exclusive.
+		DisableGSO: c.Mimic.Enabled,
 	}
 	return nil
 }
@@ -663,7 +1300,47 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 	// Depending on the config, we build a chain like this:
 	// Resolver(ACL(Outbounds...))
 
-	// Outbounds
+	obs, err := c.outboundEntries()
+	if err != nil {
+		return err
+	}
+
+	var uOb outbounds.PluggableOutbound // "unified" outbound
+
+	// ACL
+	aclRules, aclField, err := c.ACL.aclRules()
+	if err != nil {
+		return configError{Field: aclField, Err: err}
+	}
+	hasACL := aclField != ""
+	if hasACL {
+		uOb, err = outbounds.NewACLEngine(aclRules, obs, c.geoLoader())
+		if err != nil {
+			return configError{Field: aclField, Err: err}
+		}
+	} else {
+		// No ACL, use the first outbound
+		uOb = obs[0].Outbound
+	}
+
+	// Resolver
+	uOb, err = c.wrapResolver(uOb, hasACL)
+	if err != nil {
+		return err
+	}
+
+	// Speed test
+	if c.SpeedTest {
+		uOb = outbounds.NewSpeedtestHandler(uOb)
+	}
+
+	hyConfig.Outbound = &outbounds.PluggableOutboundAdapter{PluggableOutbound: uOb}
+	return nil
+}
+
+// outboundEntries creates the outbounds from the config.
+// It always returns at least one outbound.
+func (c *serverConfig) outboundEntries() ([]outbounds.OutboundEntry, error) {
 	var obs []outbounds.OutboundEntry
 	if len(c.Outbounds) == 0 {
 		// Guarantee we have at least one outbound
@@ -675,7 +1352,7 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 		obs = make([]outbounds.OutboundEntry, len(c.Outbounds))
 		for i, entry := range c.Outbounds {
 			if entry.Name == "" {
-				return configError{Field: "outbounds.name", Err: errors.New("empty outbound name")}
+				return nil, configError{Field: "outbounds.name", Err: errors.New("empty outbound name")}
 			}
 			var ob outbounds.PluggableOutbound
 			var err error
@@ -690,85 +1367,60 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 				err = configError{Field: "outbounds.type", Err: errors.New("unsupported outbound type")}
 			}
 			if err != nil {
-				return err
+				return nil, err
 			}
 			obs[i] = outbounds.OutboundEntry{Name: entry.Name, Outbound: ob}
 		}
 	}
 
-	var uOb outbounds.PluggableOutbound // "unified" outbound
+	return obs, nil
+}
 
-	// ACL
-	hasACL := false
-	if c.ACL.File != "" && len(c.ACL.Inline) > 0 {
-		return configError{Field: "acl", Err: errors.New("cannot set both acl.file and acl.inline")}
-	}
-	gLoader := &utils.GeoLoader{
+func (c *serverConfig) geoLoader() *utils.GeoLoader {
+	return &utils.GeoLoader{
 		GeoIPFilename:   c.ACL.GeoIP,
 		GeoSiteFilename: c.ACL.GeoSite,
 		UpdateInterval:  c.ACL.GeoUpdateInterval,
 		DownloadFunc:    geoDownloadFunc,
 		DownloadErrFunc: geoDownloadErrFunc,
 	}
-	if c.ACL.File != "" {
-		hasACL = true
-		acl, err := outbounds.NewACLEngineFromFile(c.ACL.File, obs, gLoader)
-		if err != nil {
-			return configError{Field: "acl.file", Err: err}
-		}
-		uOb = acl
-	} else if len(c.ACL.Inline) > 0 {
-		hasACL = true
-		acl, err := outbounds.NewACLEngineFromString(strings.Join(c.ACL.Inline, "\n"), obs, gLoader)
-		if err != nil {
-			return configError{Field: "acl.inline", Err: err}
-		}
-		uOb = acl
-	} else {
-		// No ACL, use the first outbound
-		uOb = obs[0].Outbound
-	}
+}
 
-	// Resolver
+// wrapResolver puts the configured resolver in front of next.
+func (c *serverConfig) wrapResolver(next outbounds.PluggableOutbound, hasACL bool) (outbounds.PluggableOutbound, error) {
 	switch strings.ToLower(c.Resolver.Type) {
 	case "", "system":
 		if hasACL {
 			// If the user uses ACL, we must put a resolver in front of it,
 			// for IP rules to work on domain requests.
-			uOb = outbounds.NewSystemResolver(uOb)
+			next = outbounds.NewSystemResolver(next)
 		}
 		// Otherwise we can just rely on outbound handling on its own.
 	case "tcp":
 		if c.Resolver.TCP.Addr == "" {
-			return configError{Field: "resolver.tcp.addr", Err: errors.New("empty resolver address")}
+			return nil, configError{Field: "resolver.tcp.addr", Err: errors.New("empty resolver address")}
 		}
-		uOb = outbounds.NewStandardResolverTCP(c.Resolver.TCP.Addr, c.Resolver.TCP.Timeout, uOb)
+		next = outbounds.NewStandardResolverTCP(c.Resolver.TCP.Addr, c.Resolver.TCP.Timeout, next)
 	case "udp":
 		if c.Resolver.UDP.Addr == "" {
-			return configError{Field: "resolver.udp.addr", Err: errors.New("empty resolver address")}
+			return nil, configError{Field: "resolver.udp.addr", Err: errors.New("empty resolver address")}
 		}
-		uOb = outbounds.NewStandardResolverUDP(c.Resolver.UDP.Addr, c.Resolver.UDP.Timeout, uOb)
+		next = outbounds.NewStandardResolverUDP(c.Resolver.UDP.Addr, c.Resolver.UDP.Timeout, next)
 	case "tls", "tcp-tls":
 		if c.Resolver.TLS.Addr == "" {
-			return configError{Field: "resolver.tls.addr", Err: errors.New("empty resolver address")}
+			return nil, configError{Field: "resolver.tls.addr", Err: errors.New("empty resolver address")}
 		}
-		uOb = outbounds.NewStandardResolverTLS(c.Resolver.TLS.Addr, c.Resolver.TLS.Timeout, c.Resolver.TLS.SNI, c.Resolver.TLS.Insecure, uOb)
+		next = outbounds.NewStandardResolverTLS(c.Resolver.TLS.Addr, c.Resolver.TLS.Timeout, c.Resolver.TLS.SNI, c.Resolver.TLS.Insecure, next)
 	case "https", "http":
 		if c.Resolver.HTTPS.Addr == "" {
-			return configError{Field: "resolver.https.addr", Err: errors.New("empty resolver address")}
+			return nil, configError{Field: "resolver.https.addr", Err: errors.New("empty resolver address")}
 		}
-		uOb = outbounds.NewDoHResolver(c.Resolver.HTTPS.Addr, c.Resolver.HTTPS.Timeout, c.Resolver.HTTPS.SNI, c.Resolver.HTTPS.Insecure, uOb)
+		next = outbounds.NewDoHResolver(c.Resolver.HTTPS.Addr, c.Resolver.HTTPS.Timeout, c.Resolver.HTTPS.SNI, c.Resolver.HTTPS.Insecure, next)
 	default:
-		return configError{Field: "resolver.type", Err: errors.New("unsupported resolver type")}
+		return nil, configError{Field: "resolver.type", Err: errors.New("unsupported resolver type")}
 	}
 
-	// Speed test
-	if c.SpeedTest {
-		uOb = outbounds.NewSpeedtestHandler(uOb)
-	}
-
-	hyConfig.Outbound = &outbounds.PluggableOutboundAdapter{PluggableOutbound: uOb}
-	return nil
+	return next, nil
 }
 
 func (c *serverConfig) fillBandwidthConfig(hyConfig *server.Config) error {
@@ -785,6 +1437,7 @@ func (c *serverConfig) fillBandwidthConfig(hyConfig *server.Config) error {
 			return configError{Field: "bandwidth.down", Err: err}
 		}
 	}
+	hyConfig.BandwidthConfig.DisableLossCompensation = c.Bandwidth.DisableLossCompensation
 	return nil
 }
 
@@ -867,6 +1520,99 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	return nil
 }
 
+func newMasqueradeProxyHandler(config serverConfigMasqueradeProxy) (http.Handler, error) {
+	if config.URL == "" {
+		return nil, errors.New("empty proxy url")
+	}
+	target, transport, err := newMasqueradeProxyTarget(config.URL, config.Insecure)
+	if err != nil {
+		return nil, err
+	}
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			// SetURL rewrites the Host header,
+			// but we don't want that if rewriteHost is false
+			if !config.RewriteHost {
+				r.Out.Host = r.In.Host
+			}
+			if config.XForwarded {
+				r.SetXForwarded()
+			}
+		},
+		Transport:  transport,
+		BufferPool: newMasqueradeProxyBufferPool(),
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.Error("HTTP reverse proxy error", zap.Error(err))
+			w.WriteHeader(http.StatusBadGateway)
+		},
+	}, nil
+}
+
+func newMasqueradeProxyTarget(rawURL string, insecure bool) (*url.URL, http.RoundTripper, error) {
+	target, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch target.Scheme {
+	case "http", "https":
+		transport := http.DefaultTransport
+		if insecure {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{}
+			} else {
+				tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+			}
+			tr.TLSClientConfig.InsecureSkipVerify = true
+			transport = tr
+		}
+		return target, transport, nil
+	case "unix":
+		return newUnixMasqueradeProxyTarget(target)
+	case "":
+		if strings.HasPrefix(target.Path, "/") {
+			return newUnixMasqueradeProxyTarget(target)
+		}
+		fallthrough
+	default:
+		return nil, nil, fmt.Errorf("unsupported protocol scheme \"%s\"", target.Scheme)
+	}
+}
+
+func newUnixMasqueradeProxyTarget(parsedURL *url.URL) (*url.URL, http.RoundTripper, error) {
+	if parsedURL.Opaque != "" {
+		return nil, nil, errors.New("invalid unix socket URL: path must be absolute")
+	}
+	if parsedURL.User != nil {
+		return nil, nil, errors.New("invalid unix socket URL: userinfo is not supported")
+	}
+	if parsedURL.Host != "" {
+		return nil, nil, errors.New("invalid unix socket URL: host must be empty")
+	}
+	if parsedURL.RawQuery != "" || parsedURL.ForceQuery || parsedURL.Fragment != "" {
+		return nil, nil, errors.New("invalid unix socket URL: query and fragment are not supported")
+	}
+	if parsedURL.Path == "" {
+		return nil, nil, errors.New("empty unix socket path")
+	}
+	if !strings.HasPrefix(parsedURL.Path, "/") {
+		return nil, nil, errors.New("invalid unix socket URL: path must be absolute")
+	}
+
+	socketPath := parsedURL.Path
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "unix", socketPath)
+	}
+	transport.MaxIdleConns = masqueradeProxyMaxIdleConnections
+	transport.MaxIdleConnsPerHost = masqueradeProxyMaxIdleConnsPerHost
+
+	return &url.URL{Scheme: "http", Host: "localhost"}, transport, nil
+}
+
 // fillMasqHandler must be called after fillConn, as we may need to extract the QUIC
 // port number from Conn for MasqTCPServer.
 func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
@@ -880,52 +1626,10 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 		}
 		handler = http.FileServer(http.Dir(c.Masquerade.File.Dir))
 	case "proxy":
-		if c.Masquerade.Proxy.URL == "" {
-			return configError{Field: "masquerade.proxy.url", Err: errors.New("empty proxy url")}
-		}
-		u, err := url.Parse(c.Masquerade.Proxy.URL)
+		var err error
+		handler, err = newMasqueradeProxyHandler(c.Masquerade.Proxy)
 		if err != nil {
 			return configError{Field: "masquerade.proxy.url", Err: err}
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return configError{Field: "masquerade.proxy.url", Err: fmt.Errorf("unsupported protocol scheme \"%s\"", u.Scheme)}
-		}
-		transport := http.DefaultTransport
-		if c.Masquerade.Proxy.Insecure {
-			transport = &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-				// use default configs from http.DefaultTransport
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			}
-		}
-		handler = &httputil.ReverseProxy{
-			Rewrite: func(r *httputil.ProxyRequest) {
-				r.SetURL(u)
-				// SetURL rewrites the Host header,
-				// but we don't want that if rewriteHost is false
-				if !c.Masquerade.Proxy.RewriteHost {
-					r.Out.Host = r.In.Host
-				}
-				if c.Masquerade.Proxy.XForwarded {
-					r.SetXForwarded()
-				}
-			},
-			Transport: transport,
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				logger.Error("HTTP reverse proxy error", zap.Error(err))
-				w.WriteHeader(http.StatusBadGateway)
-			},
 		}
 	case "string":
 		if c.Masquerade.String.Content == "" {
@@ -963,8 +1667,9 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 			HTTPSPort: extractPortFromAddr(c.Masquerade.ListenHTTPS),
 			Handler:   &masqHandlerLogWrapper{H: handler, QUIC: false},
 			TLSConfig: &tls.Config{
-				Certificates:   hyConfig.TLSConfig.Certificates,
-				GetCertificate: hyConfig.TLSConfig.GetCertificate,
+				Certificates:             hyConfig.TLSConfig.Certificates,
+				GetCertificate:           hyConfig.TLSConfig.GetCertificate,
+				EncryptedClientHelloKeys: hyConfig.TLSConfig.ECHKeys,
 			},
 			ForceHTTPS: c.Masquerade.ForceHTTPS,
 		}
@@ -1018,6 +1723,22 @@ func runServer(v *viper.Viper) {
 	if err != nil {
 		logger.Fatal("failed to load server config", zap.Error(err))
 	}
+
+	mimicInst, err := mimic.Start(
+		mimic.Config{
+			Enabled:   config.Mimic.Enabled,
+			Interface: config.Mimic.Interface,
+			XDPMode:   config.Mimic.XDPMode,
+			Path:      config.Mimic.Path,
+			ExtraArgs: config.Mimic.ExtraArgs,
+		},
+		mimic.RoleServer, []*net.UDPAddr{listenUDPAddr(config.Listen)}, logger,
+		func(err error) { logger.Fatal("mimic stopped", zap.Error(err)) },
+	)
+	if err != nil {
+		logger.Fatal("failed to start mimic", zap.Error(err))
+	}
+	defer mimicInst.Close()
 
 	s, err := server.NewServer(hyConfig)
 	if err != nil {
@@ -1154,4 +1875,17 @@ func extractPortFromAddr(addr string) int {
 		return 0
 	}
 	return port
+}
+
+// listenUDPAddr resolves the listen string for Mimic's filter. A wildcard host
+// stays wildcard: Mimic accepts one for a local filter.
+func listenUDPAddr(listen string) *net.UDPAddr {
+	if listen == "" {
+		listen = defaultListenAddr
+	}
+	addr, err := net.ResolveUDPAddr("udp", listen)
+	if err != nil {
+		return &net.UDPAddr{}
+	}
+	return addr
 }

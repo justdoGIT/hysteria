@@ -28,6 +28,7 @@ type Config struct {
 	TLSConfig             TLSConfig
 	QUICConfig            QUICConfig
 	Conn                  net.PacketConn
+	StatelessResetKey     *quic.StatelessResetKey
 	Cleanup               io.Closer
 	RequestHook           RequestHook
 	Outbound              Outbound
@@ -118,6 +119,8 @@ type TLSConfig struct {
 	Certificates   []tls.Certificate
 	GetCertificate func(info *tls.ClientHelloInfo) (*tls.Certificate, error)
 	ClientCAs      *x509.CertPool
+	ECHKeys        []tls.EncryptedClientHelloKey
+	GetECHKeys     func(info *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error)
 }
 
 // QUICConfig contains the QUIC configuration fields that we want to expose to the user.
@@ -129,6 +132,8 @@ type QUICConfig struct {
 	MaxIdleTimeout                 time.Duration
 	MaxIncomingStreams             int64
 	DisablePathMTUDiscovery        bool // The server may still override this to true on unsupported platforms.
+	DisableGSO                     bool
+	DisableStatelessReset          bool
 }
 
 type CongestionConfig struct {
@@ -141,21 +146,34 @@ type CongestionConfig struct {
 // The returned byte slice, if not empty, will be sent to the remote before proxying - this is
 // mainly for "putting back" the content read from the client for sniffing, etc.
 // Return a non-nil error to abort the connection.
-// Note that due to the current architectural limitations, it can only inspect the first packet
-// of a UDP connection. It also cannot put back any data as the first packet is always sent as-is.
+// For UDP, the first packets of a session are held back until the hook is done with them:
+// UDP is called with all the packets held so far each time a new one arrives, and returns
+// false to wait for the next one. The hook must give up eventually, as held packets are only
+// sent (as-is, to the possibly modified reqAddr) once it returns true.
 type RequestHook interface {
 	Check(isUDP bool, reqAddr string) bool
 	TCP(stream HyStream, reqAddr *string) ([]byte, error)
-	UDP(data []byte, reqAddr *string) error
+	UDP(packets [][]byte, reqAddr *string) (done bool, err error)
 }
 
 // Outbound provides the implementation of how the server should connect to remote servers.
 // Although UDP includes a reqAddr, the implementation does not necessarily have to use it
 // to make a "connected" UDP connection that does not accept packets from other addresses.
 // In fact, the default implementation simply uses net.ListenUDP for a "full-cone" behavior.
+// CheckUDP is used to check if a UDP packet to reqAddr is permitted (useful for e.g. ACL).
+// info describes the client connection the request comes from, and is never nil.
 type Outbound interface {
-	TCP(reqAddr string) (net.Conn, error)
-	UDP(reqAddr string) (UDPConn, error)
+	TCP(info *RequestInfo, reqAddr string) (net.Conn, error)
+	UDP(info *RequestInfo, reqAddr string) (UDPConn, error)
+	CheckUDP(info *RequestInfo, reqAddr string) error
+}
+
+// RequestInfo carries per-connection context to outbounds.
+// The same RequestInfo may be shared by multiple requests from the same client
+// connection, so implementations must not modify it.
+type RequestInfo struct {
+	AuthID     string   // ID returned by the Authenticator
+	ClientAddr net.Addr // Remote address of the client's QUIC connection
 }
 
 // UDPConn is like net.PacketConn, but uses string for addresses.
@@ -171,16 +189,20 @@ var defaultOutboundDialer = net.Dialer{
 	Timeout: 10 * time.Second,
 }
 
-func (o *defaultOutbound) TCP(reqAddr string) (net.Conn, error) {
+func (o *defaultOutbound) TCP(info *RequestInfo, reqAddr string) (net.Conn, error) {
 	return defaultOutboundDialer.Dial("tcp", reqAddr)
 }
 
-func (o *defaultOutbound) UDP(reqAddr string) (UDPConn, error) {
+func (o *defaultOutbound) UDP(info *RequestInfo, reqAddr string) (UDPConn, error) {
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return nil, err
 	}
 	return &defaultUDPConn{conn}, nil
+}
+
+func (o *defaultOutbound) CheckUDP(info *RequestInfo, reqAddr string) error {
+	return nil
 }
 
 type defaultUDPConn struct {
@@ -206,8 +228,9 @@ func (c *defaultUDPConn) WriteTo(b []byte, addr string) (int, error) {
 
 // BandwidthConfig describes the maximum bandwidth that the server can use, in bytes per second.
 type BandwidthConfig struct {
-	MaxTx uint64
-	MaxRx uint64
+	MaxTx                   uint64
+	MaxRx                   uint64
+	DisableLossCompensation bool
 }
 
 // Authenticator is an interface that provides authentication logic.

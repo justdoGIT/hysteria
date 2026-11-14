@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"context"
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
+	"github.com/apernet/hysteria/extras/v2/realm"
 	eUtils "github.com/apernet/hysteria/extras/v2/utils"
 	"github.com/stretchr/testify/assert"
 
@@ -19,12 +22,31 @@ func TestServerConfig(t *testing.T) {
 	var config serverConfig
 	err = viper.Unmarshal(&config)
 	assert.NoError(t, err)
+	assertAllFieldsSet(t, config, "server")
 	assert.Equal(t, config, serverConfig{
 		Listen: ":8443",
+		Realm: serverConfigRealm{
+			STUNServers:       []string{"stun1.example.com:3478", "stun2.example.com:3478"},
+			STUNTimeout:       6 * time.Second,
+			PunchTimeout:      12 * time.Second,
+			HeartbeatInterval: 25 * time.Second,
+			Insecure:          true,
+			IPMode:            "v6",
+			PortMapping: realmPortMappingConfig{
+				Enabled:  true,
+				Timeout:  3 * time.Second,
+				Lifetime: 2 * time.Hour,
+			},
+		},
 		Obfs: serverConfigObfs{
 			Type: "salamander",
 			Salamander: serverConfigObfsSalamander{
 				Password: "cry_me_a_r1ver",
+			},
+			Gecko: serverConfigObfsGecko{
+				Password:      "g3ck0_in_the_wall",
+				MinPacketSize: 100,
+				MaxPacketSize: 1200,
 			},
 		},
 		TLS: &serverConfigTLS{
@@ -32,6 +54,9 @@ func TestServerConfig(t *testing.T) {
 			Key:      "some.key",
 			SNIGuard: "strict",
 			ClientCA: "some_ca.crt",
+		},
+		ECH: &serverConfigECH{
+			KeyPath: "some_ech.pem",
 		},
 		ACME: &serverConfigACME{
 			Domains: []string{
@@ -69,14 +94,23 @@ func TestServerConfig(t *testing.T) {
 			MaxIdleTimeout:              999 * time.Second,
 			MaxIncomingStreams:          256,
 			DisablePathMTUDiscovery:     true,
+			DisableStatelessReset:       true,
+		},
+		Mimic: mimicConfig{
+			Enabled:   true,
+			Interface: "eth0",
+			XDPMode:   "skb",
+			Path:      "/usr/bin/mimic",
+			ExtraArgs: []string{"--padding", "random"},
 		},
 		Congestion: serverConfigCongestion{
 			Type:       "reno",
 			BBRProfile: "aggressive",
 		},
 		Bandwidth: serverConfigBandwidth{
-			Up:   "500 mbps",
-			Down: "100 mbps",
+			Up:                      "500 mbps",
+			Down:                    "100 mbps",
+			DisableLossCompensation: true,
 		},
 		IgnoreClientBandwidth: true,
 		SpeedTest:             true,
@@ -132,6 +166,13 @@ func TestServerConfig(t *testing.T) {
 				"lmao(ok)",
 				"kek(cringe,boba,tea)",
 			},
+			Rules: []serverConfigACLRule{
+				{Outbound: "alice_exit", Match: `auth.id == "alice"`},
+				{Outbound: "default", Match: "dst.port == 53", Hijack: "1.1.1.1"},
+				{Legacy: "reject(geoip:cn)"},
+				{LegacyFile: "legacy_acl.txt"},
+			},
+			RulesFile:         "acl_rules.yaml",
 			GeoIP:             "some.dat",
 			GeoSite:           "some_site.dat",
 			GeoUpdateInterval: 168 * time.Hour,
@@ -255,4 +296,69 @@ func TestResolveServerListenAddr(t *testing.T) {
 		_, _, err := resolveServerListenAddr("127.0.0.1:9001-")
 		assert.EqualError(t, err, "9001- is not a valid port number or range")
 	})
+}
+
+func TestParseServerRealmAddr(t *testing.T) {
+	addr, ok, err := parseServerRealmAddr("realm+http://token@example.com/realm?stun=stun.example.com:3478")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "http", addr.RendezvousScheme)
+	assert.Equal(t, "realm", addr.RealmID)
+	assert.Equal(t, []string{"stun.example.com:3478"}, (&serverConfig{}).realmSTUNServers(addr))
+
+	_, ok, err = parseServerRealmAddr(":443")
+	assert.False(t, ok)
+	assert.NoError(t, err)
+
+	_, ok, err = parseServerRealmAddr("realm://example.com/realm")
+	assert.True(t, ok)
+	assert.Error(t, err)
+}
+
+func TestServerRealmSTUNServers(t *testing.T) {
+	addr, ok, err := parseServerRealmAddr("realm://token@example.com/realm")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+
+	c := &serverConfig{}
+	assert.Equal(t, defaultRealmSTUNServers, c.realmSTUNServers(addr))
+
+	c.Realm.STUNServers = []string{"custom.example.com:3478"}
+	assert.Equal(t, []string{"custom.example.com:3478"}, c.realmSTUNServers(addr))
+}
+
+func TestRealmSessionHelpers(t *testing.T) {
+	assert.Equal(t, time.Minute, sessionTTLDuration(0))
+	assert.Equal(t, 10*time.Second, sessionTTLDuration(10))
+
+	assert.True(t, isRealmSessionInvalid(&realm.StatusError{StatusCode: 401}))
+	assert.True(t, isRealmSessionInvalid(&realm.StatusError{StatusCode: 404}))
+	assert.False(t, isRealmSessionInvalid(&realm.StatusError{StatusCode: 503}))
+	assert.False(t, isRealmSessionInvalid(assert.AnError))
+
+	assert.True(t, isRealmRegisterFatal(&realm.StatusError{StatusCode: 400}))
+	assert.False(t, isRealmRegisterFatal(&realm.StatusError{StatusCode: 429}))
+	assert.False(t, isRealmRegisterFatal(&realm.StatusError{StatusCode: 503}))
+	assert.False(t, isRealmRegisterFatal(assert.AnError))
+}
+
+func TestRealmConnectAddrsCacheHit(t *testing.T) {
+	want := []netip.AddrPort{
+		netip.MustParseAddrPort("203.0.113.10:4433"),
+		netip.MustParseAddrPort("[2001:db8::1]:4433"),
+	}
+	rt := &realmServerRuntime{
+		addrs:   append([]netip.AddrPort(nil), want...),
+		addrsAt: time.Now(),
+	}
+	got, err := rt.connectAddrs(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, want, got)
+
+	// Cache should still hold the same values; no mutation through aliasing.
+	assert.Equal(t, want, rt.addrs)
+
+	// Mutating the returned slice must not affect the cached one.
+	got[0] = netip.MustParseAddrPort("198.51.100.1:1")
+	assert.Equal(t, want, rt.addrs)
 }

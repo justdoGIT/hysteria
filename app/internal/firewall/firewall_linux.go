@@ -111,7 +111,13 @@ func setupNFTablesRedirect(r commandRunner, listenAddr *net.UDPAddr, ports, redi
 				if match := nftDestinationMatch(family, listenAddr); match != nil {
 					args = append(args, match...)
 				}
-				args = append(args, "udp", "dport", nftPortExpr(portRange), "redirect", "to", fmt.Sprintf(":%d", ports[0].Start))
+				if family == "ip6" && listenAddr.IP != nil && !listenAddr.IP.IsUnspecified() {
+					args = append(args, "udp", "dport", nftPortExpr(portRange), "dnat", "to",
+						fmt.Sprintf("[%s]:%d", listenAddr.IP.String(), ports[0].Start))
+				} else {
+					args = append(args, "udp", "dport", nftPortExpr(portRange), "redirect", "to",
+						fmt.Sprintf(":%d", ports[0].Start))
+				}
 				if err := nft(args...); err != nil {
 					_ = cleanup.Close()
 					return nil, err
@@ -142,7 +148,19 @@ func setupIPTablesRedirect(r commandRunner, listenAddr *net.UDPAddr, ports, redi
 			_ = ipt("-t", "nat", "-F", chainName)
 			_ = ipt("-t", "nat", "-X", chainName)
 		})
-		if err := ipt("-t", "nat", "-A", chainName, "-p", "udp", "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", ports[0].Start)); err != nil {
+		var targetArgs []string
+		if bin == "ip6tables" && listenAddr.IP != nil && !listenAddr.IP.IsUnspecified() {
+			targetArgs = []string{
+				"-t", "nat", "-A", chainName, "-p", "udp", "-j", "DNAT",
+				"--to-destination", fmt.Sprintf("[%s]:%d", listenAddr.IP.String(), ports[0].Start),
+			}
+		} else {
+			targetArgs = []string{
+				"-t", "nat", "-A", chainName, "-p", "udp", "-j", "REDIRECT",
+				"--to-ports", fmt.Sprintf("%d", ports[0].Start),
+			}
+		}
+		if err := ipt(targetArgs...); err != nil {
 			_ = cleanup.Close()
 			return nil, err
 		}
@@ -177,7 +195,9 @@ func nftFamiliesForAddr(addr *net.UDPAddr) []string {
 
 func nftDestinationMatch(family string, addr *net.UDPAddr) []string {
 	if addr.IP == nil || addr.IP.IsUnspecified() {
-		return nil
+		// A wildcard bind listens on this host's addresses, not every destination.
+		// In particular, OUTPUT must not redirect connections to remote servers.
+		return []string{"fib", "daddr", "type", "local"}
 	}
 	if family == "ip6" {
 		return []string{"ip6", "daddr", addr.IP.String()}
@@ -216,7 +236,7 @@ func iptablesBinariesForAddr(r commandRunner, addr *net.UDPAddr) ([]string, erro
 
 func iptablesDestinationMatch(addr *net.UDPAddr) []string {
 	if addr.IP == nil || addr.IP.IsUnspecified() {
-		return nil
+		return []string{"-m", "addrtype", "--dst-type", "LOCAL"}
 	}
 	return []string{"-d", addr.IP.String()}
 }

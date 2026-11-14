@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
 	"errors"
 	"math/rand"
@@ -36,10 +37,12 @@ func convertToStdTLSConfig(config *Config) *tls.Config {
 		clientAuth = tls.NoClientCert
 	}
 	return http3.ConfigureTLSConfig(&tls.Config{
-		Certificates:   config.TLSConfig.Certificates,
-		GetCertificate: config.TLSConfig.GetCertificate,
-		ClientCAs:      config.TLSConfig.ClientCAs,
-		ClientAuth:     clientAuth,
+		Certificates:                config.TLSConfig.Certificates,
+		GetCertificate:              config.TLSConfig.GetCertificate,
+		ClientCAs:                   config.TLSConfig.ClientCAs,
+		ClientAuth:                  clientAuth,
+		EncryptedClientHelloKeys:    config.TLSConfig.ECHKeys,
+		GetEncryptedClientHelloKeys: config.TLSConfig.GetECHKeys,
 	})
 }
 
@@ -61,7 +64,24 @@ func NewServer(config *Config) (Server, error) {
 		AssumePeerMaxDatagramFrameSize: protocol.MaxDatagramFrameSize,
 		DisablePathManager:             true,
 	}
-	tr := &quic.Transport{Conn: config.Conn}
+	tr := &quic.Transport{
+		Conn:       config.Conn,
+		DisableGSO: config.QUICConfig.DisableGSO,
+	}
+	// A nil key means quic-go never sends stateless resets. Clients then have to
+	// wait for the idle timeout to notice the server is gone, so keep them on
+	// unless the user explicitly asks otherwise.
+	if !config.QUICConfig.DisableStatelessReset {
+		srk := config.StatelessResetKey
+		if srk == nil {
+			var k quic.StatelessResetKey
+			if _, err := crand.Read(k[:]); err != nil {
+				return nil, err
+			}
+			srk = &k
+		}
+		tr.StatelessResetKey = srk
+	}
 	listener, err := tr.Listen(tlsConfig, quicConfig)
 	if err != nil {
 		err = errors.Join(err, tr.Close(), config.Conn.Close())
@@ -173,7 +193,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					actualTx = h.config.BandwidthConfig.MaxTx
 				}
 				if actualTx > 0 {
-					congestion.UseBrutal(h.conn, actualTx)
+					congestion.UseBrutal(h.conn, actualTx, h.config.BandwidthConfig.DisableLossCompensation)
 				} else {
 					// Client doesn't know its own bandwidth, use the configured congestion controller.
 					congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
@@ -199,9 +219,17 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !h.config.DisableUDP {
 				go func() {
 					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
+						&udpIOImpl{
+							Conn:          h.conn,
+							AuthID:        id,
+							TrafficLogger: h.config.TrafficLogger,
+							RequestHook:   h.config.RequestHook,
+							Outbound:      h.config.Outbound,
+							RequestInfo:   &RequestInfo{AuthID: id, ClientAddr: h.conn.RemoteAddr()},
+						},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
-						h.config.UDPIdleTimeout)
+						h.config.UDPIdleTimeout,
+					)
 					h.udpSM = sm
 					go sm.Run()
 				}()
@@ -286,7 +314,10 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	}
 	// Dial target
 	streamStats.State.Store(StreamStateConnecting)
-	tConn, err := h.config.Outbound.TCP(reqAddr)
+	tConn, err := h.config.Outbound.TCP(&RequestInfo{
+		AuthID:     h.authID,
+		ClientAddr: h.conn.RemoteAddr(),
+	}, reqAddr)
 	if err != nil {
 		if !hooked {
 			_ = protocol.WriteTCPResponse(stream, false, err.Error())
@@ -342,6 +373,7 @@ type udpIOImpl struct {
 	TrafficLogger TrafficLogger
 	RequestHook   RequestHook
 	Outbound      Outbound
+	RequestInfo   *RequestInfo
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
@@ -385,16 +417,20 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	return io.Conn.SendDatagram(buf[:msgN])
 }
 
-func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
+func (io *udpIOImpl) Hook(packets [][]byte, reqAddr *string) (bool, error) {
 	if io.RequestHook != nil && io.RequestHook.Check(true, *reqAddr) {
-		return io.RequestHook.UDP(data, reqAddr)
+		return io.RequestHook.UDP(packets, reqAddr)
 	} else {
-		return nil
+		return true, nil
 	}
 }
 
 func (io *udpIOImpl) UDP(reqAddr string) (UDPConn, error) {
-	return io.Outbound.UDP(reqAddr)
+	return io.Outbound.UDP(io.RequestInfo, reqAddr)
+}
+
+func (io *udpIOImpl) CheckUDP(reqAddr string) error {
+	return io.Outbound.CheckUDP(io.RequestInfo, reqAddr)
 }
 
 type udpEventLoggerImpl struct {

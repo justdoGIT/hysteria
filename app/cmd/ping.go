@@ -45,12 +45,16 @@ func runPing(v *viper.Viper, addr string) {
 		logger.Fatal("failed to load client config", zap.Error(err))
 	}
 
+	mimicInst := config.startMimic()
+	defer mimicInst.Close()
+
 	c, info, err := client.NewClient(hyConfig)
 	if err != nil {
 		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
 	defer c.Close()
 	logger.Info("connected to server",
+		zap.String("addr", info.ServerAddr.String()),
 		zap.Bool("udpEnabled", info.UDPEnabled),
 		zap.Uint64("tx", info.Tx))
 
